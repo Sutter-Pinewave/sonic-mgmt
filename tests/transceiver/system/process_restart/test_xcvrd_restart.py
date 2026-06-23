@@ -45,6 +45,10 @@ from tests.transceiver.common.prerequisites import (
     standard_port_recovery_and_verification,
     get_dut_interfaces_status
 )
+from tests.transceiver.common.process_restart_helpers import (
+    restart_xcvrd, 
+    get_xcvrd_uptime
+)
 from spytest.apis.system.i2c import err_simulation
 
 logger = logging.getLogger(__name__)
@@ -59,12 +63,6 @@ def _is_oper_up(duthost, port):
     intf_status = get_dut_interfaces_status(duthost)
     s = intf_status.get(port, {}) or {}
     return s.get("admin") == "up" and s.get("oper") == "up"
-
-def _restart_xcvrd(duthost):
-    duthost.shell("docker exec pmon supervisorctl restart xcvrd")
-
-def _get_xcvrd_uptime(duthost):
-    return duthost.shell("docker exec pmon supervisorctl status xcvrd | awk '{print $NF}'")
 
 
 
@@ -122,13 +120,13 @@ def test_system_xcvrd_restart_simple(duthost, port_attributes_dict):
     failures = []  # collected across every (port, step) tuple
 
     logger.info("Recording link states and uptime for %d port(s)", len(ports))
-    logger.info("Recording initialXcvrD uptime: %s", _get_xcvrd_uptime(duthost))
+    logger.info("Recording initialXcvrD uptime: %s", get_xcvrd_uptime(duthost))
     for port in ports:
         if not _is_oper_up(duthost, port,):
             logger.warning("Validation on Start FAILED: %s is down", port)
     
     logger.info("Restarting xcvrd daemon...")
-    _restart_xcvrd(duthost)
+    restart_xcvrd(duthost)
     
     # Wait for settle time and verify
     for port in ports:
@@ -181,7 +179,7 @@ def test_system_xcvrd_restart_with_i2c_errors(duthost, port_attributes_dict):
     err_simulation(duthost, state='start')
     
     logger.info("Restarting xcvrd daemon with I2C errors present...")
-    _restart_xcvrd(duthost)
+    restart_xcvrd(duthost)
 
     #Wait, then run verification after restart
     for port in ports:
@@ -224,8 +222,8 @@ def test_system_xcvrd_crash_recovery(duthost, port_attributes_dict):
     shared_state = {}
     failures = []  # collected across every (port, step) tuple
 
-    logger.info("Recording initial link states for %d port(s)", len(ports))
-    logger.info("Recording initial XcvrD uptime: %s", _get_xcvrd_uptime(duthost))
+    logger.info("Recording initial link states for %d port(s)", len(ports)) 
+    logger.info("Recording initial XcvrD uptime: %s", get_xcvrd_uptime(duthost))
     for port in ports:
         if not _is_oper_up(duthost, port,):
             logger.warning("Validation on Start FAILED: %s is down", port)
