@@ -1,0 +1,1 @@
+# expect_pmon_restart_with_swss_or_syncd 	    Whether pmon restart is expected during swss/syncd restart

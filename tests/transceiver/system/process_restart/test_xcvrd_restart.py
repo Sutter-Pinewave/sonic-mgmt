@@ -37,73 +37,18 @@ pytest.fail at the end, so a single run surfaces all issues across all ports.
 import logging
 import re
 import time
-
 import pytest
 
-from tests.transceiver.attribute_parser.attribute_keys import SYSTEM_ATTRIBUTES_KEY
 from tests.transceiver.common.prerequisites import (
     standard_port_recovery_and_verification,
-    get_dut_interfaces_status
+    check_links_up
 )
-from tests.transceiver.common.process_restart_helpers import (
-    restart_xcvrd, 
-    get_xcvrd_uptime
-)
+import tests.transceiver.common.process_restart_helpers as pr_helpers
 from spytest.apis.system.i2c import err_simulation
 
 logger = logging.getLogger(__name__)
 
-
-# TODO: See if there are existing functions in /common, or move these there
-def _sys_attr(port_attrs, name, default):
-    """Extract system attribute from port attributes dict with default fallback."""
-    return port_attrs.get(SYSTEM_ATTRIBUTES_KEY, {}).get(name, default)
-
-def _is_oper_up(duthost, port):
-    intf_status = get_dut_interfaces_status(duthost)
-    s = intf_status.get(port, {}) or {}
-    return s.get("admin") == "up" and s.get("oper") == "up"
-
-
-
-#AI junk functions
-# def _inject_xcvrd_crash(duthost):
-#     """Inject a crash into xcvrd by modifying the script to raise an exception."""
-#     logger.info("Injecting crash into xcvrd by modifying script...")
-    
-#     # Create a backup of the original xcvrd script
-#     duthost.shell(f"sudo cp {XCVRD_SCRIPT} {XCVRD_SCRIPT}.bak")
-    
-#     # Add a line that raises an exception early in the script
-#     # We'll insert it after imports to trigger a crash on startup
-#     crash_injection = 'raise Exception("Intentional crash for test_system_xcvrd_crash_recovery")'
-    
-#     try:
-#         result = duthost.shell(
-#             f"sudo python3 -c \"import sys; content = open('{XCVRD_SCRIPT}', 'r').read(); "
-#             f"lines = content.split('\\\\n'); "
-#             f"insert_idx = next((i for i, l in enumerate(lines) if l.strip() and not l.startswith('#') and 'import' in l), -1) + 1; "
-#             f"if insert_idx > 0: lines.insert(insert_idx, '{crash_injection}'); "
-#             f"open('{XCVRD_SCRIPT}', 'w').write('\\\\n'.join(lines))\"",
-#             module_ignore_errors=True
-#         )
-#         logger.info("Crash injection step completed")
-#     except Exception as e:
-#         logger.warning("Crash injection failed: %s", str(e))
-
-
-# def _restore_xcvrd_script(duthost):
-#     """Restore the original xcvrd script from backup."""
-#     logger.info("Restoring original xcvrd script...")
-#     try:
-#         # duthost.shell(f"sudo mv {XCVRD_SCRIPT}.bak {XCVRD_SCRIPT}", module_ignore_errors=True)
-#         duthost.shell(f"sudo mv {XCVRD_SCRIPT}.bak {XCVRD_SCRIPT}") #TODO validate module_ignore_errors
-#         logger.info("xcvrd script restored")
-#     except Exception as e:
-#         logger.warning("Script restoration failed: %s", str(e))
-
-
-def test_system_xcvrd_restart_simple(duthost, port_attributes_dict):
+def test_system_xcvrd_restart(duthost, port_attributes_dict):
     """ 
     Implements the test described in docs\testplan\transceiver\system_test_plan.md
 
@@ -120,18 +65,18 @@ def test_system_xcvrd_restart_simple(duthost, port_attributes_dict):
     failures = []  # collected across every (port, step) tuple
 
     logger.info("Recording link states and uptime for %d port(s)", len(ports))
-    logger.info("Recording initialXcvrD uptime: %s", get_xcvrd_uptime(duthost))
+    logger.info("Recording initialXcvrD uptime: %s", pr_helpers.get_xcvrd_uptime(duthost))
     for port in ports:
-        if not _is_oper_up(duthost, port,):
+        if not check_links_up(duthost, port,):
             logger.warning("Validation on Start FAILED: %s is down", port)
     
     logger.info("Restarting xcvrd daemon...")
-    restart_xcvrd(duthost)
+    pr_helpers.restart_xcvrd(duthost)
     
     # Wait for settle time and verify
     for port in ports:
         port_attrs = port_attributes_dict[port]
-        xcvrd_wait = _sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
+        xcvrd_wait = pr_helpers.sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
         result = standard_port_recovery_and_verification(
             duthost, port, port_attrs,
             link_up_timeout_sec=xcvrd_wait,
@@ -165,26 +110,26 @@ def test_system_xcvrd_restart_with_i2c_errors(duthost, port_attributes_dict):
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
 
-    xcvrd_wait = _sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
+    xcvrd_wait = pr_helpers.sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
     shared_state = {}
     failures = []  # collected across every (port, step) tuple
 
     logger.info("Recording initial link states for %d port(s)", len(ports))
-    logger.info("Recording initial XcvrD uptime: %s", _get_xcvrd_uptime(duthost))
+    logger.info("Recording initial XcvrD uptime: %s", pr_helpers.get_xcvrd_uptime(duthost))
     for port in ports:
-        if not _is_oper_up(duthost, port,):
+        if not check_links_up(duthost, port,):
             logger.warning("Validation on Start FAILED: %s is down", port)
     
     logger.info("Inducing I2C errors...")
     err_simulation(duthost, state='start')
     
     logger.info("Restarting xcvrd daemon with I2C errors present...")
-    restart_xcvrd(duthost)
+    pr_helpers.restart_xcvrd(duthost)
 
     #Wait, then run verification after restart
     for port in ports:
         port_attrs = port_attributes_dict[port]
-        xcvrd_wait = _sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
+        xcvrd_wait = pr_helpers.sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
         result = standard_port_recovery_and_verification(
             duthost, port, port_attrs,
             link_up_timeout_sec=xcvrd_wait,
@@ -223,13 +168,13 @@ def test_system_xcvrd_crash_recovery(duthost, port_attributes_dict):
     failures = []  # collected across every (port, step) tuple
 
     logger.info("Recording initial link states for %d port(s)", len(ports)) 
-    logger.info("Recording initial XcvrD uptime: %s", get_xcvrd_uptime(duthost))
+    logger.info("Recording initial XcvrD uptime: %s", pr_helpers.get_xcvrd_uptime(duthost))
     for port in ports:
-        if not _is_oper_up(duthost, port,):
+        if not check_links_up(duthost, port,):
             logger.warning("Validation on Start FAILED: %s is down", port)
     
     logger.info("Injecting crash into xcvrd script...")
-    _inject_xcvrd_crash(duthost)
+    pr_helpers.inject_xcvrd_crash(duthost)
     
     # Phase 3: Monitor automatic restart behavior 
     #TODO
@@ -238,7 +183,7 @@ def test_system_xcvrd_crash_recovery(duthost, port_attributes_dict):
     for port in ports:
         port_attrs = port_attributes_dict[port]
         logger.info("Running Standard Port Recovery and Verification for %d port(s)", len(ports))
-        xcvrd_wait = _sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
+        xcvrd_wait = pr_helpers.sys_attr(port_attrs, "xcvrd_restart_settle_sec", 120)
         result = standard_port_recovery_and_verification(
             duthost, port, port_attrs,
             link_up_timeout_sec=xcvrd_wait,
@@ -255,4 +200,3 @@ def test_system_xcvrd_crash_recovery(duthost, port_attributes_dict):
             f"xcvrd crash recovery FAILED on {len(failures)} port(s):\n  - "
             + "\n  - ".join(failures)
         )
-#TEST COMMENT
