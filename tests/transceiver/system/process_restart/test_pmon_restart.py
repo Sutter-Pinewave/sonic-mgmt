@@ -17,7 +17,7 @@ def test_system_pmon_restart(duthost, port_attributes_dict):
 
     Simple pmon restart:
         1. Verify all ports are operationally up and record link up time
-        2. Restart pmon using 'docker exec pmon supervisorctl restart pmon'
+        2. Restart pmon using 'sudo systemctl restart pmon'
         3. Wait for pmon_restart_settle_sec
         4. Execute Standard Port Recovery and Verification Procedure for all ports
         5. Verify pmon has been running for at least pmon_restart_settle_sec
@@ -28,7 +28,7 @@ def test_system_pmon_restart(duthost, port_attributes_dict):
     failures = []  # collected across every (port, step) tuple
 
     logger.info("Recording link states and uptime for %d port(s)", len(ports))
-    logger.info("Recording initial link uptime: %s", pr_helpers.(duthost))
+    logger.info("Recording initial link uptime: %s", pr_helpers.get_xcvrd_uptime(duthost))
     for port in ports:
         if not check_links_up(duthost, port,):
             logger.warning("Validation on Start FAILED: %s is down", port)
