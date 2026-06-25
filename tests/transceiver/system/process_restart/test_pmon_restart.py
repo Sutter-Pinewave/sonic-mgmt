@@ -8,6 +8,7 @@ from tests.transceiver.common.prerequisites import (
     check_links_up
 )
 import tests.transceiver.common.process_restart_helpers as pr_helpers
+from tests.transceiver.conftest import expected_pid_changes
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ def test_system_pmon_restart(duthost, port_attributes_dict):
         4. Execute Standard Port Recovery and Verification Procedure for all ports
         5. Verify pmon has been running for at least pmon_restart_settle_sec
     """
+    expected_pid_changes.add("xcvrd")
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
     shared_state = {}

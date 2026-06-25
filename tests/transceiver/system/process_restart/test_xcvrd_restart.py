@@ -43,6 +43,7 @@ from tests.transceiver.common.prerequisites import (
     standard_port_recovery_and_verification,
     check_links_up
 )
+from tests.transceiver.conftest import expected_pid_changes
 import tests.transceiver.common.process_restart_helpers as pr_helpers
 from spytest.apis.system.i2c import err_simulation
 
@@ -59,6 +60,7 @@ def test_system_xcvrd_restart(duthost, port_attributes_dict):
         4. Execute Standard Port Recovery and Verification Procedure for all ports
         5. Verify xcvrd has been running for at least xcvrd_restart_settle_sec
     """
+    expected_pid_changes.add("xcvrd")
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
     shared_state = {}
@@ -107,6 +109,7 @@ def test_system_xcvrd_restart_with_i2c_errors(duthost, port_attributes_dict):
         5. Wait for xcvrd_restart_settle_sec before verification
         6. Execute Standard Port Recovery and Verification Procedure for all ports
     """
+    expected_pid_changes.add("xcvrd")
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
 
@@ -162,6 +165,7 @@ def test_system_xcvrd_crash_recovery(duthost, port_attributes_dict):
         5. Execute Standard Port Recovery and Verification Procedure for all ports
         6. Verify xcvrd has been running for at least xcvrd_restart_settle_sec
     """
+    expected_pid_changes.add("xcvrd")
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
     shared_state = {}
