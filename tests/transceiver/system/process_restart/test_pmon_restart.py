@@ -1,18 +1,22 @@
 import logging
-import re
 import time
 import pytest
 
 from tests.transceiver.common.prerequisites import (
-    standard_port_recovery_and_verification,
     check_links_up
 )
-import tests.transceiver.common.process_restart_helpers as pr_helpers
-from tests.transceiver.conftest import expected_pid_changes
+from tests.transceiver.common.verification import (
+    standard_port_recovery_and_verification,
+    list_core_files
+)
+import tests.transceiver.common.process_restart_helpers as prh
+from tests.common.platform.processes_utils import check_process_up
+
 
 logger = logging.getLogger(__name__)
 
-def test_system_pmon_restart(duthost, port_attributes_dict):
+@pytest.mark.disable_loganalyzer
+def test_system_pmon_restart(duthost, port_attributes_dict, expected_pid_changes):
     """ 
     Implements the test described in docs\testplan\transceiver\system_test_plan.md
 
@@ -26,22 +30,25 @@ def test_system_pmon_restart(duthost, port_attributes_dict):
     expected_pid_changes.add("xcvrd")
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
-    shared_state = {}
+    shared_state = {"core_baseline": list_core_files(duthost)}
     failures = []  # collected across every (port, step) tuple
 
     logger.info("Recording link states and uptime for %d port(s)", len(ports))
-    logger.info("Recording initial link uptime: %s", pr_helpers.get_xcvrd_uptime(duthost))
-    for port in ports:
-        if not check_links_up(duthost, port,):
-            logger.warning("Validation on Start FAILED: %s is down", port)
+    if not check_links_up(duthost, port_attributes_dict):
+        logger.warning("Validation on Start FAILED: %s is down", port)
+    else:
+        for port in ports:
+            logger.info("Recording initial link uptime: %s", 
+                        prh.get_db_port_table(duthost,port,attr_filter='last_up_time'))
     
     logger.info("Restarting pmon...")
-    pr_helpers.restart_pmon(duthost)
+    prh.restart_process(duthost, 'pmon')
+    pmon_wait = prh.sys_attr(port_attributes_dict[ports[0]], "pmon_restart_settle_sec", 120)
+    time.sleep(pmon_wait+60) #accounts for minimum timeout behavior of SPRaV
     
     # Wait for settle time and verify
     for port in ports:
         port_attrs = port_attributes_dict[port]
-        pmon_wait = pr_helpers.sys_attr(port_attrs, "pmon_restart_settle_sec", 120)
         result = standard_port_recovery_and_verification(
             duthost, port, port_attrs,
             link_up_timeout_sec=pmon_wait,

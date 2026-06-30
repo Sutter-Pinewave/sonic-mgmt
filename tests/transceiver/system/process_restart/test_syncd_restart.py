@@ -1,37 +1,21 @@
 import logging
-import re
 import time
 import pytest
 
-from tests.common.devices import duthosts
 from tests.transceiver.common.prerequisites import (
-    standard_port_recovery_and_verification,
     check_links_up
+)
+from tests.transceiver.common.verification import (
+    standard_port_recovery_and_verification,
+    list_core_files
 )
 import tests.transceiver.common.process_restart_helpers as prh
 from tests.common.platform.processes_utils import check_process_up
-from tests.transceiver.conftest import expected_pid_changes
-from tests.transceiver.system.link_behavior.test_port_link_toggle import _startup_port
 
 logger = logging.getLogger(__name__)
 
-@pytest.fixture(autouse=True, scope="module")
-def _restore_containers_after_module(duthost, port_attributes_dict):
-    yield
-    ports = sorted(port_attributes_dict.keys())
-    if not ports:
-        return
-    port_attrs = port_attributes_dict[ports[0]]
-    logger.info("Link-behavior teardown: ensuring %d DUT(s) have containers up", len(ports))
-    waitTime = 0
-    for process in ['xcvrd', 'pmon', 'syncd']:
-        if not check_process_up(duthost, process, minimal_runtime=2):
-            prh.restart_process(duthost, process)
-            waitTime = max(waitTime, prh.sys_attr(port_attrs, f"{process}_restart_settle_sec", getattr(prh, f"DEFAULT_{process.upper()}_SETTLE_SEC")))
-    time.sleep(waitTime)
-            
-
-def test_system_syncd_restart(duthost, port_attributes_dict):
+@pytest.mark.disable_loganalyzer
+def test_system_syncd_restart(duthost, port_attributes_dict, expected_pid_changes):
     """ 
     Implements the syncd restarttest described in docs\testplan\transceiver\system_test_plan.md
 
@@ -45,18 +29,20 @@ def test_system_syncd_restart(duthost, port_attributes_dict):
     expected_pid_changes.add("xcvrd")
     ports = sorted(port_attributes_dict.keys())
     assert ports, "port_attributes_dict is empty - nothing to validate"
-    shared_state = {}
     failures = [] 
+    shared_state = {"core_baseline": list_core_files(duthost)}
 
     logger.info("Recording link states and uptime for %d port(s)", len(ports))
-    for port in ports:
-        if not check_links_up(duthost, port,):
-            logger.warning("Validation on Start FAILED: %s is down", port)
-    logger.info("Recording initial link uptime: %s", prh.get_xcvrd_uptime(duthost))
+    if not check_links_up(duthost, port_attributes_dict):
+        logger.warning("Validation on Start FAILED: %s is down", port)
+    else:
+        for port in ports:
+            logger.info("Recording initial link uptime: %s", 
+                        prh.get_db_port_table(duthost,port,attr_filter='last_up_time'))
     
     logger.info("Restarting syncd...")
-    prh.restart_syncd(duthost)
-    syncd_wait = prh.sys_attr(port_attrs, "syncd_restart_settle_sec", prh.DEFAULT_SYNCD_SETTLE_SEC)
+    prh.restart_process(duthost, "syncd")
+    syncd_wait = prh.sys_attr(port_attributes_dict[ports[0]], "syncd_restart_settle_sec", prh.DEFAULT_SYNCD_SETTLE_SEC)
     time.sleep(syncd_wait)
 
     #Check if pmon is expected to restart with syncd restart, and verify if it did
@@ -65,7 +51,7 @@ def test_system_syncd_restart(duthost, port_attributes_dict):
         logger.info("Verifying pmon restart after syncd restart...")
         if check_process_up(duthost, 'pmon'): # False means pmon restarted, so fail on TRUE
             failures.append(f"[startup] {result['details']}")
-            logger.warning("pmon FAILED to Restart when expect_pmon_restart_with_swss_or_syncd is True")
+            logger.warning("pmon FAILED to restart when expect_pmon_restart_with_swss_or_syncd is True")
     
     # Wait for settle time and verify
     for port in ports:
@@ -77,9 +63,9 @@ def test_system_syncd_restart(duthost, port_attributes_dict):
         )
         if not result["passed"]:
             failures.append(f"[startup] {result['details']}")
-            logger.warning("Startup validation FAILED: %s", result["details"])
+            logger.warning("Post-restart validation FAILED: %s", result["details"])
         else:
-            logger.info("Startup validation PASSED: %s", result["details"])
+            logger.info("Post-restart validation PASSED: %s", result["details"])
     
     if failures:
         pytest.fail(
