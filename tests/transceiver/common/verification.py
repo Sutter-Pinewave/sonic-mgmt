@@ -14,7 +14,11 @@ from tests.transceiver.attribute_parser.attribute_keys import (
     BASE_ATTRIBUTES_KEY, DOM_ATTRIBUTES_KEY, EEPROM_ATTRIBUTES_KEY,
     SYSTEM_ATTRIBUTES_KEY,
 )
-from tests.transceiver.common import db_helpers
+from tests.transceiver.common import cli_helpers, db_helpers
+from tests.transceiver.common.cmis_helper import (
+    CMIS_PAGE_11_ACS_SI_PAGE, CMIS_PAGE_11_ACS_SI_SIZE, CMIS_PAGE_11_ACS_SI_START,
+    compare_optics_si_settings, lanes_from_mask,
+)
 from tests.transceiver.common.eeprom_decode import is_cmis_active_optical
 from tests.transceiver.common.prerequisites import (
     wait_until_health_ok, wait_until_links_up,
@@ -25,6 +29,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_STABILITY_WINDOW_SEC = 5
 _LLDP_POLL_INTERVAL_SEC = 3
 _CMIS_POLL_INTERVAL_SEC = 3
+
+# xcvrd publishes the NPU SI handshake in STATE_DB PORT_TABLE; orchagent sets
+# it to DONE once the media SI values in APPL_DB PORT_TABLE are applied.
+NPU_SI_SETTINGS_SYNC_STATUS_KEY = "NPU_SI_SETTINGS_SYNC_STATUS"
+NPU_SI_SETTINGS_DONE_VALUE = "NPU_SI_SETTINGS_DONE"
 
 
 def check_lldp_neighbors_present(
@@ -453,6 +462,170 @@ def check_cmis_state(
     return {port: per_port[port] for port in ports}
 
 
+# ──────────────────────────────────────────────────────────────────────
+# SI Settings Verification (Standard Procedure sub-check 6)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _port_host_lanes(port_attributes_dict, port):
+    """Return ``(host_lanes, error)`` from the port's BASE_ATTRIBUTES.host_lane_mask."""
+    try:
+        raw_mask = port_attributes_dict[port][BASE_ATTRIBUTES_KEY]["host_lane_mask"]
+        return lanes_from_mask(raw_mask), None
+    except (KeyError, ValueError) as error:
+        return None, f"missing or invalid BASE_ATTRIBUTES.host_lane_mask: {error}"
+
+
+def check_optics_si_settings(duthost, ports, port_attributes_dict):
+    """Verify each port's ``optics_si_settings`` against the module's applied SI.
+
+    Reads the CMIS page 11h Active Control Set once per port, in one batched
+    DUT call, and compares only the lanes selected by the port's
+    BASE_ATTRIBUTES.host_lane_mask so breakout siblings are checked against
+    their own lanes.
+
+    Args:
+        duthost: SONiC DUT host fixture.
+        ports: logical ports to check; each should carry a non-empty
+            ``SYSTEM_ATTRIBUTES.optics_si_settings``.
+        port_attributes_dict: resolved per-port attributes.
+
+    Returns:
+        dict: ``{port: {'passed': bool, 'details': str, 'failure_reason': str}}``,
+        one entry per ``ports``; ``failure_reason`` is present only on failure.
+    """
+    per_port = {}
+    read_ports = {}
+    for port in ports:
+        attrs = port_attributes_dict[port]
+        expected = attrs.get(SYSTEM_ATTRIBUTES_KEY, {}).get("optics_si_settings") or {}
+        if not expected:
+            per_port[port] = {"passed": True, "details": f"{port}: optics SI settings not configured"}
+            continue
+        if not is_cmis_active_optical(attrs.get(EEPROM_ATTRIBUTES_KEY, {})):
+            reason = "optics_si_settings configured on a non-CMIS-active-optical module"
+            per_port[port] = {"passed": False, "details": f"{port}: {reason}", "failure_reason": reason}
+            continue
+        lanes, error = _port_host_lanes(port_attributes_dict, port)
+        if error:
+            per_port[port] = {"passed": False, "details": f"{port}: {error}", "failure_reason": error}
+            continue
+        read_ports[port] = (expected, lanes)
+
+    eeprom = cli_helpers.sfputil_read_eeprom_batch(
+        duthost, list(read_ports),
+        page=f"0x{CMIS_PAGE_11_ACS_SI_PAGE:02X}",
+        offset=CMIS_PAGE_11_ACS_SI_START, size=CMIS_PAGE_11_ACS_SI_SIZE,
+    )
+    for port, (expected, lanes) in read_ports.items():
+        byte_map, err = eeprom[port]
+        if err:
+            reason = f"optics SI EEPROM read failed: {err}"
+        else:
+            problems, compared = compare_optics_si_settings(expected, byte_map, lanes)
+            if not problems and not compared:
+                problems = [f"no optics_si_settings entries map to host lanes {lanes}"]
+            reason = "optics SI mismatch: " + "; ".join(problems) if problems else None
+        if reason:
+            logger.warning("Optics SI check FAILED: %s: %s", port, reason)
+            per_port[port] = {"passed": False, "details": f"{port}: {reason}", "failure_reason": reason}
+        else:
+            details = f"{port}: optics SI matches EEPROM for {compared} lane value(s) on host lanes {lanes}"
+            logger.info("Optics SI check PASSED: %s", details)
+            per_port[port] = {"passed": True, "details": details}
+    return {port: per_port[port] for port in ports}
+
+
+def _normalize_si_token(token):
+    """Normalize one media SI lane value: ints compare numerically, else case-insensitively."""
+    text = str(token).strip()
+    try:
+        return int(text, 0)
+    except ValueError:
+        return text.lower()
+
+
+def check_media_si_settings(duthost, ports, port_attributes_dict, namespaces=None):
+    """Verify each port's ``media_si_settings`` against APPL_DB PORT_TABLE.
+
+    Also requires the NPU SI handshake (``NPU_SI_SETTINGS_SYNC_STATUS``) to
+    read ``NPU_SI_SETTINGS_DONE``. PORT_TABLE reads are batched per namespace.
+
+    Args:
+        duthost: SONiC DUT host fixture.
+        ports: logical ports to check; each should carry a non-empty
+            ``SYSTEM_ATTRIBUTES.media_si_settings``.
+        port_attributes_dict: resolved per-port attributes. ``media_si_settings``
+            uses the media_settings.json leaf shape ``{field: {"lane<N>": value}}``
+            (lane keys 0-indexed module lanes) or ``{field: value}`` for scalar
+            fields. Lanes are selected with BASE_ATTRIBUTES.host_lane_mask, the
+            same per-subport slice xcvrd publishes for breakout ports.
+        namespaces: optional ``{port: namespace}``.
+
+    Returns:
+        dict: ``{port: {'passed': bool, 'details': str, 'failure_reason': str}}``,
+        one entry per ``ports``; ``failure_reason`` is present only on failure.
+    """
+    appl_entries = db_helpers.get_appl_db_port_table_entries(duthost, ports, namespaces)
+    state_entries = {}
+    state_errors = {}
+    for namespace, ns_ports in db_helpers.group_ports_by_namespace(duthost, ports, namespaces).items():
+        table, err = db_helpers.get_state_db_table(duthost, "PORT_TABLE", namespace=namespace)
+        for port in ns_ports:
+            if err:
+                state_errors[port] = err
+            else:
+                state_entries[port] = table.get(port, {})
+
+    per_port = {}
+    for port in ports:
+        expected = port_attributes_dict[port].get(SYSTEM_ATTRIBUTES_KEY, {}).get("media_si_settings") or {}
+        if not expected:
+            per_port[port] = {"passed": True, "details": f"{port}: media SI settings not configured"}
+            continue
+        problems = []
+        if port in state_errors:
+            problems.append(f"STATE_DB PORT_TABLE read failed: {state_errors[port]}")
+        else:
+            sync_status = state_entries[port].get(NPU_SI_SETTINGS_SYNC_STATUS_KEY)
+            if sync_status != NPU_SI_SETTINGS_DONE_VALUE:
+                problems.append(
+                    f"{NPU_SI_SETTINGS_SYNC_STATUS_KEY}={sync_status!r} (expected {NPU_SI_SETTINGS_DONE_VALUE})"
+                )
+        lanes, error = _port_host_lanes(port_attributes_dict, port)
+        if error:
+            problems.append(error)
+        else:
+            appl_entry = appl_entries.get(port, {})
+            for field, value in sorted(expected.items()):
+                if isinstance(value, dict):
+                    missing = [f"lane{lane - 1}" for lane in lanes if f"lane{lane - 1}" not in value]
+                    if missing:
+                        problems.append(f"{field}: attribute missing {missing} for host lanes {lanes}")
+                        continue
+                    expected_tokens = [value[f"lane{lane - 1}"] for lane in lanes]
+                else:
+                    expected_tokens = [value]
+                actual = appl_entry.get(field)
+                if actual is None:
+                    problems.append(f"{field}: missing from APPL_DB PORT_TABLE")
+                    continue
+                actual_tokens = actual.split(",")
+                if [_normalize_si_token(t) for t in actual_tokens] != [_normalize_si_token(t) for t in expected_tokens]:
+                    problems.append(
+                        f"{field}: attribute={','.join(str(t) for t in expected_tokens)}, APPL_DB={actual}"
+                    )
+        if problems:
+            reason = "media SI mismatch: " + "; ".join(problems)
+            logger.warning("Media SI check FAILED: %s: %s", port, reason)
+            per_port[port] = {"passed": False, "details": f"{port}: {reason}", "failure_reason": reason}
+        else:
+            details = f"{port}: media SI matches APPL_DB for {len(expected)} field(s); NPU SI sync done"
+            logger.info("Media SI check PASSED: %s", details)
+            per_port[port] = {"passed": True, "details": details}
+    return per_port
+
+
 def standard_port_recovery_and_verification(
     duthost, ports, port_attributes_dict, link_up_timeout_sec, health_baseline,
     lport_to_first_subport_mapping,
@@ -460,6 +633,7 @@ def standard_port_recovery_and_verification(
     stability_window_sec=DEFAULT_STABILITY_WINDOW_SEC,
     expected_pid_changes=None,
     pre_operation_sentinels=None,
+    verify_si_settings=False,
 ):
     """Run the Standard Port Recovery and Verification Procedure on a
     batch of ports (link status, flap/stability, LLDP, CMIS state,
@@ -495,6 +669,10 @@ def standard_port_recovery_and_verification(
             stay down; resolution errors or missing entries fail the affected
             ports only if LLDP verification is enabled (the default).
             LLDP-disabled ports do not require peer entries.
+        verify_si_settings: opt-in SI Settings sub-check. When True, linked-up
+            ports with a non-empty ``optics_si_settings`` run
+            :func:`check_optics_si_settings` and ports with a non-empty
+            ``media_si_settings`` run :func:`check_media_si_settings`.
     Returns:
         dict: ``{'passed': bool, 'per_port':
         {port: {'passed': bool, 'details': str}}, 'details': str,
@@ -512,7 +690,8 @@ def standard_port_recovery_and_verification(
     That snapshot also supplies CMIS link-up times without another DB read.
     LLDP budgets share one start time captured immediately after the batch
     link-recovery phase, before the baseline snapshot is read.
-    Remote link-state, SI, and BER verification are not yet implemented here.
+    Remote link-state and BER verification are not yet implemented here; SI
+    verification runs only when ``verify_si_settings`` is True.
     DUT UTC time captured at entry also bounds CMIS freshness, so a no-flap
     operation cannot pass using status published before recovery verification.
     """
@@ -640,6 +819,20 @@ def standard_port_recovery_and_verification(
             sum(not result["passed"] for result in cmis_results.values()),
         )
         record_results("CMIS", cmis_results)
+
+    # 6. SI settings - opt-in so existing callers keep their check set.
+    if verify_si_settings:
+        def _has_si(port, attr):
+            return bool(port_attributes_dict[port].get(SYSTEM_ATTRIBUTES_KEY, {}).get(attr))
+
+        optics_si_ports = [port for port in up_ports if _has_si(port, "optics_si_settings")]
+        media_si_ports = [port for port in up_ports if _has_si(port, "media_si_settings")]
+        if optics_si_ports:
+            record_results("optics SI", check_optics_si_settings(duthost, optics_si_ports, port_attributes_dict))
+        if media_si_ports:
+            record_results("media SI", check_media_si_settings(
+                duthost, media_si_ports, port_attributes_dict, namespaces=namespaces,
+            ))
 
     # 7. Docker/process health - one batched poll, host-wide, unconditionally.
     #    Shares link_up_timeout_sec with step 1: whatever the link-up poll

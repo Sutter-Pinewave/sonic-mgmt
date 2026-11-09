@@ -33,6 +33,7 @@ transceiver test aggregates per-port failures into a single
 ``pytest.fail`` at the end, and an exception inside the loop would
 short-circuit that pattern.
 """
+import shlex
 import time
 
 from tests.transceiver.common.cli_parser_helper import (
@@ -74,6 +75,7 @@ SHOW_TRANSCEIVER_PRESENCE = "show interfaces transceiver presence"
 SFPUTIL_FIRMWARE_DOWNLOAD = "sfputil firmware download"
 SFPUTIL_FIRMWARE_RUN = "sfputil firmware run"
 SFPUTIL_FIRMWARE_COMMIT = "sfputil firmware commit"
+SFPUTIL_DEBUG_LOOPBACK = "sfputil debug loopback"
 
 # Max characters of stdout/stderr echoed into a failure message.  Some sfputil
 # errors dump the full 500+ port list, which would bury the failure summary in
@@ -176,6 +178,11 @@ def sfputil_read_eeprom_cmd(port, *, offset, size, page=None, wire_addr=None):
         f" -o {_as_decimal_int(offset)} -s {_as_decimal_int(size)}"
     )
     return cmd
+
+
+def sfputil_debug_loopback_cmd(port, mode, enable):
+    """Return ``sfputil debug loopback <port> <mode> enable|disable``."""
+    return f"{SFPUTIL_DEBUG_LOOPBACK} {port} {mode} {'enable' if enable else 'disable'}"
 
 
 def sfputil_show_fwversion_cmd(port):
@@ -299,6 +306,123 @@ def sfputil_read_eeprom(duthost, port, *, offset, size, page=None, wire_addr=Non
         port, offset=offset, size=size, page=page, wire_addr=wire_addr,
     )
     return _run_and_parse(duthost, cmd, parse_read_eeprom)
+
+
+# Markers delimiting each port's output in a batched per-port command run.
+_BATCH_PORT_MARKER = "@@XCVR_BATCH_PORT@@"
+_BATCH_RC_MARKER = "@@XCVR_BATCH_RC@@"
+
+
+def _run_per_port_batch(duthost, cmds_by_port):
+    """Run one command per port in a single DUT shell call.
+
+    Args:
+        duthost: SONiC DUT host fixture.
+        cmds_by_port: ``{port: cmd}``; each ``cmd`` is a full command string.
+
+    Returns:
+        dict: ``{port: (rc, stdout_lines)}``, one entry per ``cmds_by_port``.
+        A port whose output block is missing (e.g. the shell call itself
+        failed) reports ``rc=None`` with whatever lines were captured.
+    """
+    if not cmds_by_port:
+        return {}
+    script = "\n".join(
+        f"echo {_BATCH_PORT_MARKER} {shlex.quote(port)}; {cmd} 2>&1; echo {_BATCH_RC_MARKER} $?"
+        for port, cmd in cmds_by_port.items()
+    )
+    result = duthost.shell(script, module_ignore_errors=True)
+    blocks = {}
+    current = None
+    for line in result.get("stdout_lines") or []:
+        if line.startswith(_BATCH_PORT_MARKER):
+            current = line[len(_BATCH_PORT_MARKER):].strip()
+            blocks[current] = [None, []]
+        elif current is not None and line.startswith(_BATCH_RC_MARKER):
+            try:
+                blocks[current][0] = int(line[len(_BATCH_RC_MARKER):].strip())
+            except ValueError:
+                pass
+            current = None
+        elif current is not None:
+            blocks[current][1].append(line)
+    return {
+        port: tuple(blocks.get(port, (None, [])))
+        for port in cmds_by_port
+    }
+
+
+def _batch_error(cmd, rc, lines):
+    """Build the per-port failure string for a batched command."""
+    detail = " ".join(lines).strip()[:CLI_ERROR_DETAIL_MAX_CHARS] or "no output"
+    return f"{cmd} failed with rc={rc} (output: {detail})"
+
+
+def sfputil_read_eeprom_batch(duthost, ports, *, offset, size, page=None):
+    """Run ``sfputil read-eeprom`` for every port in one DUT call.
+
+    Same per-port semantics as :func:`sfputil_read_eeprom`, but batched so a
+    many-port read costs one round-trip instead of one per port.
+
+    Args:
+        duthost: SONiC DUT host fixture.
+        ports: logical port names to read.
+        offset, size, page: see :func:`sfputil_read_eeprom_cmd`.
+
+    Returns:
+        dict: ``{port: (byte_map, err)}`` where ``byte_map`` is
+        ``{offset: byte_int}`` and ``err`` is ``None`` on success.
+    """
+    cmds = {
+        port: sfputil_read_eeprom_cmd(port, offset=offset, size=size, page=page)
+        for port in ports
+    }
+    results = {}
+    for port, (rc, lines) in _run_per_port_batch(duthost, cmds).items():
+        if rc != 0:
+            results[port] = (None, _batch_error(cmds[port], rc, lines))
+        elif not lines:
+            results[port] = (None, f"{cmds[port]} returned empty output")
+        else:
+            results[port] = (parse_read_eeprom(lines), None)
+    return results
+
+
+def sfputil_debug_loopback_batch(duthost, ports, mode, enable):
+    """Enable or disable one loopback ``mode`` on every port in one DUT call.
+
+    ``sfputil debug loopback`` applies the mode to the lanes owned by the
+    named logical port only, so breakout siblings are configured independently.
+
+    Args:
+        duthost: SONiC DUT host fixture.
+        ports: logical port names.
+        mode: loopback mode, e.g. ``"host-side-input"``.
+        enable: True to enable, False to disable.
+
+    Returns:
+        dict: ``{port: err}``; ``err`` is ``None`` on success.
+    """
+    return run_per_port_commands(
+        duthost, {port: sfputil_debug_loopback_cmd(port, mode, enable) for port in ports},
+    )
+
+
+def run_per_port_commands(duthost, cmds_by_port):
+    """Run one arbitrary command per port in a single DUT call; success is rc 0.
+
+    Args:
+        duthost: SONiC DUT host fixture.
+        cmds_by_port: ``{port: cmd}``; each ``cmd`` is a full shell command.
+
+    Returns:
+        dict: ``{port: err}``; ``err`` is ``None`` on success, else a
+        single-line failure string with rc and truncated output.
+    """
+    return {
+        port: None if rc == 0 else _batch_error(cmds_by_port[port], rc, lines)
+        for port, (rc, lines) in _run_per_port_batch(duthost, cmds_by_port).items()
+    }
 
 
 def sfputil_show_fwversion(duthost, port):

@@ -32,6 +32,7 @@ from tests.common.helpers.dut_utils import get_program_info
 from tests.common.platform.interface_utils import wait_ports_oper_status
 from tests.common.platform.processes_utils import get_docker_started_at
 from tests.common.reboot import reboot
+from tests.transceiver.attribute_parser.attribute_keys import SYSTEM_ATTRIBUTES_KEY
 from tests.transceiver.common import cli_helpers
 from tests.transceiver.common.health_checks import DEFAULT_MONITORED_PROCESSES
 
@@ -120,6 +121,26 @@ def scale_bulk_wait(per_port_wait_sec, num_ports):
     """
     factor = max(1.0, num_ports / BASE_PORT_COUNT)
     return int(per_port_wait_sec * factor)
+
+
+def scale_bulk_wait_for_ports(port_attributes_dict, ports, attr, default=None):
+    """Scale the slowest port's SYSTEM_ATTRIBUTES ``attr`` wait to a bulk operation.
+
+    Args:
+        port_attributes_dict: resolved per-port attributes.
+        ports: ports the bulk operation acts on (non-empty).
+        attr: per-port wait attribute, e.g. ``"port_startup_wait_sec"``.
+        default: value for ports without the attribute; ``None`` requires it
+            (raising ``KeyError`` when absent).
+
+    Returns:
+        int: :func:`scale_bulk_wait` of the maximum per-port wait.
+    """
+    def _wait(port):
+        system_attrs = port_attributes_dict[port].get(SYSTEM_ATTRIBUTES_KEY, {})
+        return system_attrs[attr] if default is None else system_attrs.get(attr, default)
+
+    return scale_bulk_wait(max(_wait(port) for port in ports), len(ports))
 
 
 def poll_ports_recovered(check_fn, wait_sec, interval_sec, label):
